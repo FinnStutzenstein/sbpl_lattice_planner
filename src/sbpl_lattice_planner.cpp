@@ -41,12 +41,14 @@
 #include <sbpl_lattice_planner/SBPLLatticePlannerStats.h>
 
 #include <costmap_2d/inflation_layer.h>
+#include <mbf_msgs/GetPathResult.h>
 
 using namespace std;
 using namespace ros;
 
 
 PLUGINLIB_DECLARE_CLASS(sbpl_latice_planner, SBPLLatticePlanner, sbpl_lattice_planner::SBPLLatticePlanner, nav_core::BaseGlobalPlanner);
+PLUGINLIB_DECLARE_CLASS(sbpl_latice_planner, SBPLLatticePlanner, sbpl_lattice_planner::SBPLLatticePlanner, mbf_costmap_core::CostmapPlanner);
 
 namespace sbpl_lattice_planner{
 
@@ -77,11 +79,11 @@ class LatticeSCQ : public StateChangeQuery{
 };
 
 SBPLLatticePlanner::SBPLLatticePlanner()
-  : initialized_(false), costmap_ros_(NULL){
+  : initialized_(false), costmap_ros_(NULL), canceled_(false){
 }
 
 SBPLLatticePlanner::SBPLLatticePlanner(std::string name, costmap_2d::Costmap2DROS* costmap_ros)
-  : initialized_(false), costmap_ros_(NULL){
+  : initialized_(false), costmap_ros_(NULL), canceled_(false){
   initialize(name, costmap_ros);
 }
 
@@ -108,7 +110,11 @@ void SBPLLatticePlanner::initialize(std::string name, costmap_2d::Costmap2DROS* 
     int lethal_obstacle;
     private_nh.param("lethal_obstacle",lethal_obstacle,20);
     lethal_obstacle_ = (unsigned char) lethal_obstacle;
-    inscribed_inflated_obstacle_ = lethal_obstacle_-1;
+    if(lethal_obstacle_ > 1){
+        inscribed_inflated_obstacle_ = (unsigned char)(lethal_obstacle_ - 1);
+    }else{
+        inscribed_inflated_obstacle_ = 0;
+    }
     sbpl_cost_multiplier_ = (unsigned char) (costmap_2d::INSCRIBED_INFLATED_OBSTACLE/inscribed_inflated_obstacle_ + 1);
     ROS_DEBUG("SBPL: lethal: %uz, inscribed inflated: %uz, multiplier: %uz",lethal_obstacle,inscribed_inflated_obstacle_,sbpl_cost_multiplier_);
 
@@ -167,8 +173,8 @@ void SBPLLatticePlanner::initialize(std::string name, costmap_2d::Costmap2DROS* 
                                 timetoturn45degsinplace_secs, obst_cost_thresh,
                                 primitive_filename_.c_str());
     }
-    catch(SBPL_Exception e){
-      ROS_ERROR("SBPL encountered a fatal exception!");
+    catch(SBPL_Exception &e){
+      ROS_ERROR("SBPL encountered a fatal exception: %s", e.what());
       ret = false;
     }
     if(!ret){
@@ -238,11 +244,21 @@ void SBPLLatticePlanner::publishStats(int solution_cost, int solution_size,
 bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
                                  const geometry_msgs::PoseStamped& goal,
                                  std::vector<geometry_msgs::PoseStamped>& plan){
+    double cost; // Dummy
+    string message; // Dummy
+    return makePlan(start, goal, 0.0, plan, cost, message) == mbf_msgs::GetPathResult::SUCCESS;
+}
+
+
+uint32_t SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped &start, const geometry_msgs::PoseStamped &goal,
+                                      double /*tolerance*/, std::vector<geometry_msgs::PoseStamped> &plan, double &cost,
+                                      std::string &/*message*/){
   if(!initialized_){
     ROS_ERROR("Global planner is not initialized");
-    return false;
+    return mbf_msgs::GetPathResult::NOT_INITIALIZED;
   }
 
+  canceled_ = false;
   plan.clear();
 
   ROS_INFO("[sbpl_lattice_planner] getting start point (%g,%g) goal point (%g,%g)",
@@ -254,24 +270,24 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
     int ret = env_->SetStart(start.pose.position.x - costmap_ros_->getCostmap()->getOriginX(), start.pose.position.y - costmap_ros_->getCostmap()->getOriginY(), theta_start);
     if(ret < 0 || planner_->set_start(ret) == 0){
       ROS_ERROR("ERROR: failed to set start state\n");
-      return false;
+      return mbf_msgs::GetPathResult::INTERNAL_ERROR;
     }
   }
-  catch(SBPL_Exception e){
-    ROS_ERROR("SBPL encountered a fatal exception while setting the start state");
-    return false;
+  catch(SBPL_Exception &e){
+    ROS_ERROR("SBPL encountered a fatal exception while setting the start state: %s", e.what());
+    return mbf_msgs::GetPathResult::INTERNAL_ERROR;
   }
 
   try{
     int ret = env_->SetGoal(goal.pose.position.x - costmap_ros_->getCostmap()->getOriginX(), goal.pose.position.y - costmap_ros_->getCostmap()->getOriginY(), theta_goal);
     if(ret < 0 || planner_->set_goal(ret) == 0){
       ROS_ERROR("ERROR: failed to set goal state\n");
-      return false;
+      return mbf_msgs::GetPathResult::INTERNAL_ERROR;
     }
   }
-  catch(SBPL_Exception e){
-    ROS_ERROR("SBPL encountered a fatal exception while setting the goal state");
-    return false;
+  catch(SBPL_Exception &e){
+    ROS_ERROR("SBPL encountered a fatal exception while setting the goal state: %s", e.what());
+    return mbf_msgs::GetPathResult::INTERNAL_ERROR;
   }
 
   int offOnCount = 0;
@@ -290,7 +306,6 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
       allCount++;
 
       //first case - off cell goes on
-
       if((oldCost != costMapCostToSBPLCost(costmap_2d::LETHAL_OBSTACLE) && oldCost != costMapCostToSBPLCost(costmap_2d::INSCRIBED_INFLATED_OBSTACLE)) &&
           (newCost == costMapCostToSBPLCost(costmap_2d::LETHAL_OBSTACLE) || newCost == costMapCostToSBPLCost(costmap_2d::INSCRIBED_INFLATED_OBSTACLE))) {
         offOnCount++;
@@ -300,7 +315,7 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
           (newCost != costMapCostToSBPLCost(costmap_2d::LETHAL_OBSTACLE) && newCost != costMapCostToSBPLCost(costmap_2d::INSCRIBED_INFLATED_OBSTACLE))) {
         onOffCount++;
       }
-      env_->UpdateCost(ix, iy, costMapCostToSBPLCost(costmap_ros_->getCostmap()->getCost(ix,iy)));
+      env_->UpdateCost(ix, iy, newCost);
 
       nav2dcell_t nav2dcell;
       nav2dcell.x = ix;
@@ -319,9 +334,9 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
     if(allCount > force_scratch_limit_)
       planner_->force_planning_from_scratch();
   }
-  catch(SBPL_Exception e){
+  catch(SBPL_Exception &e){
     ROS_ERROR("SBPL failed to update the costmap");
-    return false;
+    return mbf_msgs::GetPathResult::INTERNAL_ERROR;
   }
 
   //setting planner parameters
@@ -334,17 +349,21 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
   int solution_cost;
   try{
     int ret = planner_->replan(allocated_time_, &solution_stateIDs, &solution_cost);
-    if(ret)
-      ROS_DEBUG("Solution is found\n");
-    else{
+    cost = (double)solution_cost;
+    if (canceled_) {
+        return mbf_msgs::GetPathResult::CANCELED;
+    }
+    if(ret) {
+        ROS_DEBUG("Solution is found\n");
+    }else{
       ROS_INFO("Solution not found\n");
       publishStats(solution_cost, 0, start, goal);
-      return false;
+      return mbf_msgs::GetPathResult::NO_PATH_FOUND;
     }
   }
-  catch(SBPL_Exception e){
-    ROS_ERROR("SBPL encountered a fatal exception while planning");
-    return false;
+  catch(SBPL_Exception &e){
+    ROS_ERROR("SBPL encountered a fatal exception while planning: %s", e.what());
+    return mbf_msgs::GetPathResult::INTERNAL_ERROR;
   }
 
   ROS_DEBUG("size of solution=%d", (int)solution_stateIDs.size());
@@ -353,9 +372,9 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
   try{
     env_->ConvertStateIDPathintoXYThetaPath(&solution_stateIDs, &sbpl_path);
   }
-  catch(SBPL_Exception e){
-    ROS_ERROR("SBPL encountered a fatal exception while reconstructing the path");
-    return false;
+  catch(SBPL_Exception &e){
+    ROS_ERROR("SBPL encountered a fatal exception while reconstructing the path: %s", e.what());
+    return mbf_msgs::GetPathResult::INTERNAL_ERROR;
   }
   ROS_DEBUG("Plan has %d points.\n", (int)sbpl_path.size());
   ros::Time plan_time = ros::Time::now();
@@ -365,7 +384,7 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
   gui_path.poses.resize(sbpl_path.size());
   gui_path.header.frame_id = costmap_ros_->getGlobalFrameID();
   gui_path.header.stamp = plan_time;
-  for(unsigned int i=0; i<sbpl_path.size(); i++){
+  for(unsigned long i=0; i<sbpl_path.size(); i++){
     geometry_msgs::PoseStamped pose;
     pose.header.stamp = plan_time;
     pose.header.frame_id = costmap_ros_->getGlobalFrameID();
@@ -390,6 +409,11 @@ bool SBPLLatticePlanner::makePlan(const geometry_msgs::PoseStamped& start,
   plan_pub_.publish(gui_path);
   publishStats(solution_cost, sbpl_path.size(), start, goal);
 
-  return true;
+  return mbf_msgs::GetPathResult::SUCCESS;
+}
+
+bool SBPLLatticePlanner::cancel(){
+    canceled_ = true;
+    return planner_->cancel();
 }
 };

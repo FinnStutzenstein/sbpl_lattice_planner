@@ -17,10 +17,11 @@ using namespace std;
 
 //global representation
 #include <nav_core/base_global_planner.h>
+#include <mbf_costmap_core/costmap_planner.h>
 
 namespace sbpl_lattice_planner{
 
-class SBPLLatticePlanner : public nav_core::BaseGlobalPlanner{
+class SBPLLatticePlanner : public nav_core::BaseGlobalPlanner, public mbf_costmap_core::CostmapPlanner{
 public:
   
   /**
@@ -56,6 +57,26 @@ public:
                         const geometry_msgs::PoseStamped& goal, 
                         std::vector<geometry_msgs::PoseStamped>& plan);
 
+  /**
+   * @brief Computes a plan.
+   * @param start  The start pose
+   * @param goal The goal pose
+   * @param tolerance The tolerance in x and y direction
+   * @param plan The computed plan
+   * @param cost The plan's cost
+   * @param message An message for Move Base Flex
+   * @return A status code. See Move Base Flex GetPath action for the codes.
+   */
+  virtual uint32_t makePlan(const geometry_msgs::PoseStamped &start, const geometry_msgs::PoseStamped &goal,
+                             double tolerance, std::vector<geometry_msgs::PoseStamped> &plan, double &cost,
+                             std::string &message);
+
+   /**
+   * @brief Requests the planner to cancel, e.g. if it takes too much time.
+   * @return True if a cancel has been successfully requested
+   */
+   virtual bool cancel();
+
   virtual ~SBPLLatticePlanner(){};
 
 private:
@@ -84,6 +105,8 @@ private:
   unsigned char lethal_obstacle_;
   unsigned char inscribed_inflated_obstacle_;
   unsigned char sbpl_cost_multiplier_;
+
+  bool canceled_;
 
 
   costmap_2d::Costmap2DROS* costmap_ros_; /**< manages the cost map for us */
